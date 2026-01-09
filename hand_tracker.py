@@ -7,6 +7,37 @@ import json
 from pathlib import Path
 from collections import deque
 from datetime import datetime
+import subprocess
+import re
+
+# --- CAMERA HELPERS ---
+def get_camera_names():
+    names = []
+    try:
+        result = subprocess.run(['ffmpeg', '-f', 'avfoundation', '-list_devices', 'true', '-i', ''], 
+                                stderr=subprocess.PIPE, text=True)
+        output = result.stderr
+        lines = output.split('\n')
+        parsing_video = False
+        for line in lines:
+            if "video devices:" in line:
+                parsing_video = True
+                continue
+            if "audio devices:" in line:
+                break
+            if parsing_video:
+                match = re.search(r'\[(\d+)\]\s+(.+)', line)
+                if match:
+                    names.append(match.group(2).strip())
+    except Exception as e:
+        print(f"Error fetching camera names: {e}")
+    
+    if not names:
+        names = ["Camera 0", "Camera 1", "Camera 2"]
+    return names
+
+camera_list = get_camera_names()
+dropdown_open = False
 
 # --- CONFIGURATION ---
 font_scale = 1.0
@@ -108,6 +139,7 @@ STATE_WAITING = "WAITING"
 STATE_COUNTDOWN = "COUNTDOWN"
 STATE_CALIBRATING = "CALIBRATING"
 STATE_SAVE_PROMPT = "SAVE_PROMPT"
+STATE_SETTINGS = "SETTINGS"
 STATE_ACTIVE = "ACTIVE"
 
 current_state = STATE_MENU
@@ -123,6 +155,7 @@ calibration_data_lh = []
 timer_start = 0
 calibration_duration = 3.0
 countdown_duration = 3.0
+active_camera_index = 0
 
 # --- USER INPUT / MOUSE ---
 mouse_click = None # (x, y) coordinates of last click, reset after processing
@@ -181,12 +214,17 @@ def main():
     global current_state, timer_start, mouse_click, prev_hand_pos
     global calibration_data_rh, calibration_data_lh, tracked_hands
     global baseline_rh, baseline_lh
+    global baseline_rh, baseline_lh
+    global active_camera_index, dropdown_open, camera_list
 
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.8, max_num_hands=2)
     mp_draw = mp.solutions.drawing_utils
 
-    cap = cv2.VideoCapture(0)
+    # Refresh camera list on start
+    camera_list = get_camera_names()
+
+    cap = cv2.VideoCapture(active_camera_index)
     
     cv2.namedWindow('DreamPlay Vision')
     cv2.setMouseCallback('DreamPlay Vision', mouse_callback)
@@ -203,7 +241,7 @@ def main():
         
         # Process Hands only if needed (Optimization)
         results = None
-        if current_state not in [STATE_MENU, STATE_LOAD_PROFILE]:
+        if current_state not in [STATE_MENU, STATE_LOAD_PROFILE, STATE_SETTINGS]:
             results = hands.process(image_rgb)
 
         detected_hands = []
@@ -222,17 +260,19 @@ def main():
                         cv2.FONT_HERSHEY_TRIPLEX, 1.5, (0, 255, 255), 2)
             
             # Buttons
-            cx = image.shape[1] // 2 - 150
-            cy = 250
-            btn_w, btn_h = 300, 60
+            cx = image.shape[1] // 2 - 200
+            start_y = 250
+            btn_w, btn_h = 400, 60
             gap = 80
             
-            btn_play = (cx, cy, btn_w, btn_h)
-            btn_load = (cx, cy + gap, btn_w, btn_h)
-            btn_exit = (cx, cy + gap*2, btn_w, btn_h)
+            btn_play = (cx, start_y, btn_w, btn_h)
+            btn_load = (cx, start_y + gap, btn_w, btn_h)
+            btn_settings = (cx, start_y + gap*2, btn_w, btn_h)
+            btn_exit = (cx, start_y + gap*3, btn_w, btn_h)
             
             draw_button(image, btn_play, "BEGIN PLAYING")
             draw_button(image, btn_load, "LOAD PROFILE")
+            draw_button(image, btn_settings, "SETTINGS")
             draw_button(image, btn_exit, "EXIT")
             
             if mouse_click:
@@ -240,9 +280,65 @@ def main():
                     current_state = STATE_WAITING
                 elif is_clicked(btn_load, mouse_click):
                     current_state = STATE_LOAD_PROFILE
+                elif is_clicked(btn_settings, mouse_click):
+                    current_state = STATE_SETTINGS
                 elif is_clicked(btn_exit, mouse_click):
                     break
                 mouse_click = None
+
+        elif current_state == STATE_SETTINGS:
+            # Dropdown UI
+            cv2.putText(image, "SETTINGS", (50, 80), cv2.FONT_HERSHEY_TRIPLEX, 1.2, (0, 255, 255), 2)
+            cv2.putText(image, "SELECT INPUT DEVICE:", (100, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
+
+            # Dropdown Box
+            box_x, box_y = 100, 210
+            box_w, box_h = 400, 50
+            main_box = (box_x, box_y, box_w, box_h)
+            
+            current_name = camera_list[active_camera_index] if active_camera_index < len(camera_list) else f"Device {active_camera_index}"
+            
+            cv2.rectangle(image, (box_x, box_y), (box_x + box_w, box_y + box_h), (60, 60, 60), -1)
+            cv2.rectangle(image, (box_x, box_y), (box_x + box_w, box_y + box_h), (200, 200, 200), 2)
+            cv2.putText(image, current_name, (box_x + 15, box_y + 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(image, "v", (box_x + box_w - 30, box_y + 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # Back Button
+            btn_back = (50, image.shape[0]-80, 100, 50)
+            draw_button(image, btn_back, "BACK")
+
+            # Handle Clicks
+            if mouse_click:
+                if is_clicked(btn_back, mouse_click):
+                    current_state = STATE_MENU
+                    dropdown_open = False
+                elif is_clicked(main_box, mouse_click):
+                    dropdown_open = not dropdown_open
+                
+                # Check dropdown items if open
+                if dropdown_open:
+                    for i, name in enumerate(camera_list):
+                        opt_y = box_y + box_h + (i * 45)
+                        opt_rect = (box_x, opt_y, box_w, 45)
+                        if is_clicked(opt_rect, mouse_click):
+                            active_camera_index = i
+                            cap.release()
+                            cap = cv2.VideoCapture(active_camera_index)
+                            dropdown_open = False
+                            print(f"Switched to camera: {name} (Index {i})")
+                
+                mouse_click = None
+
+            # Draw Options if Open (On top of everything)
+            if dropdown_open:
+                for i, name in enumerate(camera_list):
+                    opt_y = box_y + box_h + (i * 45)
+                    color = (80, 80, 80)
+                    if i == active_camera_index: color = (0, 100, 0)
+                    
+                    cv2.rectangle(image, (box_x, opt_y), (box_x + box_w, opt_y + 45), color, -1)
+                    cv2.rectangle(image, (box_x, opt_y), (box_x + box_w, opt_y + 45), (150, 150, 150), 1)
+                    cv2.putText(image, name, (box_x + 15, opt_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
         elif current_state == STATE_LOAD_PROFILE:
             image.fill(30)
@@ -466,7 +562,13 @@ def main():
         # Global Key Handling
         key = cv2.waitKey(1) & 0xFF
         if key == 27: # ESC
-            break
+            if current_state == STATE_SETTINGS:
+                current_state = STATE_MENU
+            elif current_state == STATE_MENU:
+                break
+            else:
+                formatted_state = STATE_MENU
+                current_state = STATE_MENU
         elif key == ord('m'):
             current_state = STATE_MENU
         elif key == ord('c') and current_state == STATE_ACTIVE:
@@ -474,6 +576,18 @@ def main():
             timer_start = time.time()
             calibration_data_rh, calibration_data_lh = [], []
             print("Manual Re-Calibration")
+        
+        # CAMERA SWITCHING (Only in Settings)
+        elif current_state == STATE_SETTINGS:
+            if key == ord('=') or key == ord('+'):
+                active_camera_index += 1
+                cap.release()
+                cap = cv2.VideoCapture(active_camera_index)
+            elif key == ord('-') or key == ord('_'):
+                if active_camera_index > 0:
+                    active_camera_index -= 1
+                    cap.release()
+                    cap = cv2.VideoCapture(active_camera_index)
 
         cv2.imshow('DreamPlay Vision', image)
 
