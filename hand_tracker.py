@@ -12,7 +12,7 @@ import re
 
 # --- CAMERA HELPERS ---
 def get_camera_names():
-    names = []
+    devices = []
     try:
         result = subprocess.run(['ffmpeg', '-f', 'avfoundation', '-list_devices', 'true', '-i', ''], 
                                 stderr=subprocess.PIPE, text=True)
@@ -28,18 +28,22 @@ def get_camera_names():
             if parsing_video:
                 match = re.search(r'\[(\d+)\]\s+(.+)', line)
                 if match:
-                    names.append(match.group(2).strip())
+                    idx = int(match.group(1))
+                    name = match.group(2).strip()
+                    devices.append({'index': idx, 'name': name})
     except Exception as e:
         print(f"Error fetching camera names: {e}")
     
-    if not names:
-        names = ["Camera 0", "Camera 1", "Camera 2"]
-    return names
+    if not devices:
+        devices = [{'index': 0, 'name': "Camera 0"}, {'index': 1, 'name': "Camera 1"}]
+    return devices
 
 camera_list = get_camera_names()
+selected_cam_list_idx = 0 # Index in our camera_list, not the hardware ID
 dropdown_open = False
 
-# --- CONFIGURATION ---
+# --- CONSTANTS & GLOBALS ---
+# ... (Continuing with globals update to ensure state consistency)
 font_scale = 1.0
 thickness = 2
 score_font_scale = 1.5
@@ -48,6 +52,17 @@ score_thickness = 4
 # --- PATHS ---
 DOCS_PATH = Path.home() / "Documents" / "DreamPlay"
 DOCS_PATH.mkdir(parents=True, exist_ok=True)
+
+# ... (Keeping Scoring Helpers and Graph Helper same) ... 
+# We need to jump to the state variables to update `active_camera_index` usage.
+# Instead of `active_camera_index` being the hardware id, let's track `selected_cam_list_idx` pointing to `camera_list`.
+# But for continuity with existing main/globals, let's keep `active_camera_index` as the HARDWARE ID,
+# and add `current_list_selection` for UI.
+
+active_camera_index = 0 
+if camera_list:
+    active_camera_index = camera_list[0]['index']
+
 
 # --- SCORING HELPERS ---
 def get_pro_score(val, baseline, is_wrist=True):
@@ -223,6 +238,12 @@ def main():
 
     # Refresh camera list on start
     camera_list = get_camera_names()
+    selected_cam_list_idx = 0
+    # Align selection with active hardware index
+    for i, dev in enumerate(camera_list):
+        if dev['index'] == active_camera_index:
+            selected_cam_list_idx = i
+            break
 
     cap = cv2.VideoCapture(active_camera_index)
     
@@ -296,7 +317,10 @@ def main():
             box_w, box_h = 400, 50
             main_box = (box_x, box_y, box_w, box_h)
             
-            current_name = camera_list[active_camera_index] if active_camera_index < len(camera_list) else f"Device {active_camera_index}"
+            # Display current selection safely
+            current_name = "Unknown"
+            if 0 <= selected_cam_list_idx < len(camera_list):
+                current_name = camera_list[selected_cam_list_idx]['name']
             
             cv2.rectangle(image, (box_x, box_y), (box_x + box_w, box_y + box_h), (60, 60, 60), -1)
             cv2.rectangle(image, (box_x, box_y), (box_x + box_w, box_y + box_h), (200, 200, 200), 2)
@@ -317,28 +341,31 @@ def main():
                 
                 # Check dropdown items if open
                 if dropdown_open:
-                    for i, name in enumerate(camera_list):
+                    for i, dev in enumerate(camera_list):
                         opt_y = box_y + box_h + (i * 45)
                         opt_rect = (box_x, opt_y, box_w, 45)
                         if is_clicked(opt_rect, mouse_click):
-                            active_camera_index = i
+                            # Update indices
+                            selected_cam_list_idx = i
+                            active_camera_index = dev['index']
+                            
                             cap.release()
                             cap = cv2.VideoCapture(active_camera_index)
                             dropdown_open = False
-                            print(f"Switched to camera: {name} (Index {i})")
+                            print(f"Switched to camera: {dev['name']} (Index {active_camera_index})")
                 
                 mouse_click = None
 
             # Draw Options if Open (On top of everything)
             if dropdown_open:
-                for i, name in enumerate(camera_list):
+                for i, dev in enumerate(camera_list):
                     opt_y = box_y + box_h + (i * 45)
                     color = (80, 80, 80)
-                    if i == active_camera_index: color = (0, 100, 0)
+                    if i == selected_cam_list_idx: color = (0, 100, 0)
                     
                     cv2.rectangle(image, (box_x, opt_y), (box_x + box_w, opt_y + 45), color, -1)
                     cv2.rectangle(image, (box_x, opt_y), (box_x + box_w, opt_y + 45), (150, 150, 150), 1)
-                    cv2.putText(image, name, (box_x + 15, opt_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                    cv2.putText(image, dev['name'], (box_x + 15, opt_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
         elif current_state == STATE_LOAD_PROFILE:
             image.fill(30)
@@ -388,9 +415,19 @@ def main():
             # Sort X
             detected_hands.sort(key=lambda h: h.landmark[0].x, reverse=True)
             
-            # Prompt
-            cv2.putText(image, "PLACE HANDS TO CALIBRATE", (100, 150), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            # Prompt Overlay
+            msg = "PLACE HANDS TO CALIBRATE"
+            (tw, th), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_TRIPLEX, 1.2, 2)
+            tx = (image.shape[1] - tw) // 2
+            ty = 150
+            
+            # Semi-transparent BG
+            overlay = image.copy()
+            cv2.rectangle(overlay, (tx - 20, ty - th - 20), (tx + tw + 20, ty + 20), (0, 0, 0), -1)
+            image = cv2.addWeighted(overlay, 0.6, image, 0.4, 0)
+            
+            cv2.putText(image, msg, (tx, ty), 
+                        cv2.FONT_HERSHEY_TRIPLEX, 1.2, (0, 255, 255), 2)
 
             # Draw Hands
             for hl in detected_hands: mp_draw.draw_landmarks(image, hl, mp_hands.HAND_CONNECTIONS)
@@ -457,36 +494,14 @@ def main():
                 if calibration_data_rh: baseline_rh["dist"] = sum(calibration_data_rh) / len(calibration_data_rh)
                 if calibration_data_lh: baseline_lh["dist"] = sum(calibration_data_lh) / len(calibration_data_lh)
                 
-                current_state = STATE_SAVE_PROMPT
-                print("Calibrated.")
+                # Auto-Save and Continue
+                fname = save_profile_file()
+                print(f"Auto-saved profile: {fname}")
+                current_state = STATE_ACTIVE
 
-        elif current_state == STATE_SAVE_PROMPT:
-            # Prompt user to save
-            # Still show hands or just overlay?
-            overlay = image.copy()
-            cv2.putText(overlay, "CALIBRATION COMPLETE", (150, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            cx = image.shape[1] // 2 - 150
-            cy = 250
-            w, h = 300, 60
-            
-            btn_save = (cx, cy, w, h)
-            btn_skip = (cx, cy + 80, w, h)
-            
-            draw_button(overlay, btn_save, "SAVE PROFILE")
-            draw_button(overlay, btn_skip, "CONTINUE")
-            
-            image = cv2.addWeighted(overlay, 1.0, image, 0.0, 0) # Overwrite
-            
-            if mouse_click:
-                if is_clicked(btn_save, mouse_click):
-                    # Save
-                    fname = save_profile_file()
-                    current_state = STATE_ACTIVE
-                elif is_clicked(btn_skip, mouse_click):
-                    current_state = STATE_ACTIVE
-                
-                mouse_click = None
+        # elif current_state == STATE_SAVE_PROMPT:
+            # Removed for seamless UX as per user request
+            # pass
 
         elif current_state == STATE_ACTIVE:
             # Persistent Tracking Logic
@@ -550,7 +565,14 @@ def main():
                     
                     # UI Text
                     x_base = 20 if label == "LH" else image.shape[1] - 350
-                    cv2.putText(image, f"{label}: {int(total_score)}%", (x_base, 80), cv2.FONT_HERSHEY_SIMPLEX, score_font_scale, color, score_thickness)
+                    # Main
+                    cv2.putText(image, f"{label}: {int(total_score)}%", (x_base, 80), 
+                                cv2.FONT_HERSHEY_SIMPLEX, score_font_scale, color, score_thickness)
+                    # Sub-scores
+                    cv2.putText(image, f"Wrist: {int(w_score)}%", (x_base, 130), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, get_status_color(w_score), 2)
+                    cv2.putText(image, f"Fingers: {int(f_score)}%", (x_base, 170), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, get_status_color(f_score), 2)
                     
                 # Always draw graphs
                 if len(graph_history[label]["total"]) > 1:
