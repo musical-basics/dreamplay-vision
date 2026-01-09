@@ -1,6 +1,7 @@
 import cv2
 import mediapipe as mp
 import numpy as np
+import time
 
 # Helper function to calculate the angle between three points
 def calculate_angle(a, b, c):
@@ -21,46 +22,41 @@ mp_draw = mp.solutions.drawing_utils
 
 cap = cv2.VideoCapture(0)
 
-import time
+# --- State Constants ---
+STATE_WAITING = 0      # Waiting for 2 hands to appear
+STATE_COUNTDOWN = 1    # Hands found, counting down
+STATE_CALIBRATING = 2  # Recording data
+STATE_ACTIVE = 3       # Normal monitoring
 
 # --- Global State ---
-calibrating = False
-calibrated = False
-calibration_start_time = 0
-calibration_duration = 3.0  # Seconds to hold the pose
+current_state = STATE_WAITING
+timer_start = 0
+calibration_duration = 3.0
+countdown_duration = 3.0
+
 calibration_data_rh = []
 calibration_data_lh = []
-
-# Final Baselines (defaults)
 baseline_rh = {"dist": 0.05}
 baseline_lh = {"dist": 0.03}
+prev_hand_pos = None
 
-def update_calibration(sorted_hands):
-    global calibrating, calibrated, calibration_start_time, baseline_rh, baseline_lh, calibration_data_rh, calibration_data_lh
+def check_stability(sorted_hands):
+    """Checks if hands are held still enough to start calibration."""
+    global prev_hand_pos
+    STABILITY_THRESHOLD = 0.02 # How much hand movement is allowed to trigger auto-start
     
-    elapsed = time.time() - calibration_start_time
-    progress = min(elapsed / calibration_duration, 1.0)
+    if len(sorted_hands) < 2: return False
     
-    # Collect data during the 3 seconds to get a stable average
-    if len(sorted_hands) >= 2:
-        # RH is index 0, LH is index 1 (based on X-coord sorting)
-        dist_rh = abs(sorted_hands[0].landmark[0].y - sorted_hands[0].landmark[9].y)
-        dist_lh = abs(sorted_hands[1].landmark[0].y - sorted_hands[1].landmark[9].y)
-        calibration_data_rh.append(dist_rh)
-        calibration_data_lh.append(dist_lh)
-
-    if progress >= 1.0:
-        # Calculate Averages
-        if calibration_data_rh:
-            baseline_rh["dist"] = sum(calibration_data_rh) / len(calibration_data_rh)
-        if calibration_data_lh:
-            baseline_lh["dist"] = sum(calibration_data_lh) / len(calibration_data_lh)
-        
-        calibrating = False
-        calibrated = True
-        print(f"Locked Baselines - RH: {baseline_rh['dist']:.3f}, LH: {baseline_lh['dist']:.3f}")
-
-    return progress
+    # Track the wrist position (Landmark 0) of the front hand (RH [0])
+    current_pos = np.array([sorted_hands[0].landmark[0].x, sorted_hands[0].landmark[0].y])
+    
+    if prev_hand_pos is None:
+        prev_hand_pos = current_pos
+        return False
+    
+    dist = np.linalg.norm(current_pos - prev_hand_pos)
+    prev_hand_pos = current_pos
+    return dist < STABILITY_THRESHOLD
 
 while cap.isOpened():
     success, image = cap.read()
@@ -69,160 +65,143 @@ while cap.isOpened():
     # Remove horizontal flip to fix the "reversed" camera view
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     results = hands.process(image_rgb)
-
-    # Dictionary to store status for the physical hands
-    statuses = {}
-
-    # Sort hands by X-coordinate (Higher X = Right Hand in side view)
+    
+    # Prepare sorting
     sorted_hands = []
     if results.multi_hand_landmarks:
+         # Sort by X-coordinate (Higher X = Right Hand in side view)
          sorted_hands = sorted(results.multi_hand_landmarks, key=lambda h: h.landmark[0].x, reverse=True)
 
-    # --- CALIBRATION MODE ---
-    if not calibrated:
-        if not calibrating:
-            cv2.putText(image, "HOLD ARCH & PRESS 'C' TO START", (50, 150), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-            if cv2.waitKey(1) & 0xFF == ord('c'):
-                calibrating = True
-                calibration_start_time = time.time()
-                calibration_data_rh, calibration_data_lh = [], []
-        else:
-            # Update progress and draw bar
-            prog = update_calibration(sorted_hands)
-            bar_width = int(prog * 300)
-            cv2.rectangle(image, (50, 180), (350, 210), (50, 50, 50), -1) # Background
-            cv2.rectangle(image, (50, 180), (50 + bar_width, 210), (0, 255, 255), -1) # Progress
-            cv2.putText(image, f"CALIBRATING: {int(prog*100)}%", (50, 170), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+    # --- Manual Reset ---
+    if cv2.waitKey(1) & 0xFF == ord('c'):
+        current_state = STATE_COUNTDOWN
+        timer_start = time.time()
+        # Reset data
+        calibration_data_rh, calibration_data_lh = [], []
+        print("Manual Reset Triggered")
 
-    # --- TRACKING MODE ---
-    if results.multi_hand_landmarks:
-        # If calibrated, we trust the X-sorting implies RH is [0] and LH is [1]
-        # Or we continue to use the sorted_hands from above
-        # For simplicity in this logic, we iterate the sorted hands
+    # --- STATE MACHINE ---
+    
+    if current_state == STATE_WAITING:
+        cv2.putText(image, "PLACE BOTH HANDS ON KEYS", (100, 150), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         
-        for i, hand_landmarks in enumerate(sorted_hands):
-            label = "RH" if i == 0 else "LH"
+        # Check if we should start countdown
+        if len(sorted_hands) == 2 and check_stability(sorted_hands):
+            current_state = STATE_COUNTDOWN
+            timer_start = time.time()
+            # Clear data just in case
+            calibration_data_rh, calibration_data_lh = [], []
+            print("Auto-Detect: Starting Countdown...")
+
+    elif current_state == STATE_COUNTDOWN:
+        elapsed = time.time() - timer_start
+        remaining = max(0, int(countdown_duration - elapsed + 1))
+        
+        # Big countdown centered
+        cv2.putText(image, f"CALIBRATING IN: {remaining}", (150, 250), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 4)
+        
+        if elapsed >= countdown_duration:
+            current_state = STATE_CALIBRATING
+            timer_start = time.time()
+            calibration_data_rh, calibration_data_lh = [], []
+
+    elif current_state == STATE_CALIBRATING:
+        elapsed = time.time() - timer_start
+        prog = min(elapsed / calibration_duration, 1.0)
+        
+        # Collect data
+        if len(sorted_hands) >= 2:
+            # RH is index 0, LH is index 1
+            dist_rh = abs(sorted_hands[0].landmark[0].y - sorted_hands[0].landmark[9].y)
+            dist_lh = abs(sorted_hands[1].landmark[0].y - sorted_hands[1].landmark[9].y)
+            calibration_data_rh.append(dist_rh)
+            calibration_data_lh.append(dist_lh)
+        
+        # Draw Progress Bar
+        bar_width = int(prog * 400)
+        cv2.rectangle(image, (100, 300), (500, 330), (50, 50, 50), -1) 
+        cv2.rectangle(image, (100, 300), (100 + bar_width, 330), (0, 255, 0), -1)
+        cv2.putText(image, "HOLD STILL...", (100, 290), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        if elapsed >= calibration_duration:
+            # Compute averages
+            if calibration_data_rh:
+                baseline_rh["dist"] = sum(calibration_data_rh) / len(calibration_data_rh)
+            if calibration_data_lh:
+                baseline_lh["dist"] = sum(calibration_data_lh) / len(calibration_data_lh)
             
-            wrist_y = hand_landmarks.landmark[0].y
-            knuckle_y = hand_landmarks.landmark[9].y
+            current_state = STATE_ACTIVE
+            print(f"Locked Baselines - RH: {baseline_rh['dist']:.3f}, LH: {baseline_lh['dist']:.3f}")
+
+    elif current_state == STATE_ACTIVE:
+        # --- TRACKING LOGIC ---
+        statuses = {}
+        
+        # Only process if we have hands (or hold last state? let's just process what we see)
+        if results.multi_hand_landmarks:
+            # We continue to use X-sorting. If one hand disappears, 
+            # the remaining hand becomes index 0 (RH).
+            # Limitation: losing one hand might mislabel the other if strictly X-sorted.
+            # But for this prototype, we assume user keeps hands in frame for monitoring.
             
-            # Baseline-Relative Detection Logic
-            error = ""
-            
-            # Use the calibrated baseline for this specific hand
-            baseline_dist = baseline_rh["dist"] if label == "RH" else baseline_lh["dist"]
-            
-            # If current wrist drop is significantly worse than refined baseline
-            # (wrist_y > knuckle_y + buffer)
-            # Here we defined 'dist' as (wrist - knuckle).
-            # If wrist drops low, wrist_y increases. (wrist - knuckle) becomes larger POSITIVE value (if wrist below knuckle)
-            # or smaller NEGATIVE value (if wrist above knuckle).
-            # NOTE: In MediaPipe Y increases downwards.
-            # Good Arch: Wrist (Low Y) is ABOVE Knuckle (High Y).  Wrist_Y < Knuckle_Y.
-            #   (Wrist - Knuckle) should be NEGATIVE.
-            # Flat/Low Wrist: Wrist (High Y) is BELOW Knuckle (Low Y). Wrist_Y > Knuckle_Y.
-            #   (Wrist - Knuckle) becomes POSITIVE.
-            
-            current_dist = wrist_y - knuckle_y
-            
-            # If our calibrated baseline captured a "textbook" arch, current_dist should be negative.
-            # If we allow a 20% deviation from that baseline?
-            # Or use the user's simplified logic: if (wrist - knuckle) > (baseline * 0.2)
-            # Assuming 'baseline' stored positive magnitude of a "safe" buffer?
-            # Actually, let's stick to the logic: "If wrist is lower than knuckle by X amount".
-            
-            # RE-READING CALIBRATION LOGIC:
-            # calibration stored: dist_rh = sorted_hands[0].landmark[0].y - sorted_hands[0].landmark[9].y
-            # If we hold a Perfect Arch, Wrist is ABOVE Knuckle. Y_wrist < Y_knuckle.
-            # So dist_rh will be NEGATIVE (e.g. -0.05).
-            
-            # So if we drop our wrist, dist_rh becomes LESS NEGATIVE (closest to 0) or POSITIVE.
-            # Check: if current_dist > baseline_dist + tolerance?
-            
-            # User suggested:
-            # if (wrist_y - knuckle_y) > (baseline_rh["dist"] * 0.2): error = "Low Wrist"
-            # This implies baseline["dist"] is a positive magnitude of "allowable drop"? 
-            # OR that we capture the *magnitude* of the perfect arch.
-            # Let's use magnitude for safety.
-            
-            # Let's refine the calibration capture:
-            # calibration stored RAW (wrist - knuckle). Likely negative.
-            # User's snippet: baseline_rh["dist"] = abs(...)
-            # Ah, user used ABS in snippet.
-            
-            # Let's fix the calibration function to use ABS as requested.
-            # Baseline = Magnitude of "Good" Arch height.
-            
-            threshold = baseline_dist + 0.02 # Add a small tolerance buffer
-            if calibrated:
-                 # If we use the ABS logic from user request
-                 # if (wrist_y - knuckle_y) > (baseline * 0.2) -> this seems risky if baseline is 0.05. 0.01 is too strict.
-                 
-                 # Let's stick to a robust logical interpretation:
-                 # We captured the "Good Position". Any deviation downwards (increasing Y) is bad.
-                 # Let's say we allow 20% degradation of the arch height before flagging.
-                 pass
-                 
-            # Re-implementing strictly based on user snippet logic for determining error:
-            # if (wrist_y - knuckle_y) > (baseline_rh["dist"] * 0.2):
-            # This implies baseline is POSITIVE.
-            
-            # NOTE: We need to make sure calibration uses ABS then.
-            
-            # Let's look at the implementation below.
-            
-            # Check Flat Finger
-            for pip_idx in [6, 10, 14, 18]:
-                mcp = [hand_landmarks.landmark[pip_idx-1].x, hand_landmarks.landmark[pip_idx-1].y]
-                pip = [hand_landmarks.landmark[pip_idx].x, hand_landmarks.landmark[pip_idx].y]
-                dip = [hand_landmarks.landmark[pip_idx+1].x, hand_landmarks.landmark[pip_idx+1].y]
+            for i, hand_landmarks in enumerate(sorted_hands):
+                # Only handle up to 2 hands
+                if i > 1: break
+                label = "RH" if i == 0 else "LH"
                 
-                angle = calculate_angle(mcp, pip, dip)
-                if angle > 165:
-                    if error == "": error = "Flat Finger"
+                wrist_y = hand_landmarks.landmark[0].y
+                knuckle_y = hand_landmarks.landmark[9].y
+                
+                # Use calibrated baseline
+                baseline_dist = baseline_rh["dist"] if label == "RH" else baseline_lh["dist"]
+                
+                error = ""
+                # Logic: If (wrist - knuckle) exceeds 20% of the baseline magnitude
+                # (Assuming baseline captured a 'good' distance magnitude)
+                threshold = baseline_dist * 0.2
+                current_dist = wrist_y - knuckle_y
+                
+                if current_dist > threshold:
+                    error = "Low Wrist"
+                    
+                # Check Flat Finger
+                for pip_idx in [6, 10, 14, 18]:
+                    mcp = [hand_landmarks.landmark[pip_idx-1].x, hand_landmarks.landmark[pip_idx-1].y]
+                    pip = [hand_landmarks.landmark[pip_idx].x, hand_landmarks.landmark[pip_idx].y]
+                    dip = [hand_landmarks.landmark[pip_idx+1].x, hand_landmarks.landmark[pip_idx+1].y]
+                    
+                    angle = calculate_angle(mcp, pip, dip)
+                    if angle > 165:
+                        if error == "": error = "Flat Finger"
 
-            # Apply Error Thresholds
-            # Using simple robust logic: 
-            # If WristY is below KnuckleY + (some buffer).
-            # If calibrated, buffer = baseline * 0.2 (as requested).
-            # Else buffer = 0.05 / 0.02
-             
-            threshold_val = 0.05 if label == "RH" else 0.02
-            if calibrated:
-                 # User logic: if (wrist_y - knuckle_y) > (baseline * 0.2)
-                 if (wrist_y - knuckle_y) > (baseline_rh["dist"] * 0.2 if label == "RH" else baseline_lh["dist"] * 0.2):
-                     error = "Low Wrist"
-            else:
-                 if wrist_y > knuckle_y + threshold_val:
-                     error = "Low Wrist"
+                # Store status
+                color = (0, 0, 255) if error != "" else (0, 255, 0)
+                msg = f"Incorrect ({error})" if error != "" else "Correct"
+                statuses[label] = {"msg": msg, "color": color}
 
-            # Store status
-            color = (0, 0, 255) if error != "" else (0, 255, 0)
-            msg = f"Incorrect ({error})" if error != "" else "Correct"
-            statuses[label] = {"msg": msg, "color": color}
+                # Draw skeleton
+                mp_draw.draw_landmarks(
+                    image, 
+                    hand_landmarks, 
+                    mp_hands.HAND_CONNECTIONS,
+                    mp_draw.DrawingSpec(color=color, thickness=2, circle_radius=2),
+                    mp_draw.DrawingSpec(color=color, thickness=2)
+                )
 
-            # Draw skeleton with dynamic Line and Landmark colors
-            mp_draw.draw_landmarks(
-                image, 
-                hand_landmarks, 
-                mp_hands.HAND_CONNECTIONS,
-                mp_draw.DrawingSpec(color=color, thickness=2, circle_radius=2), # Dots
-                mp_draw.DrawingSpec(color=color, thickness=2) # Lines
-            )
+        # Display Text
+        y_pos = 50
+        for hand_label in ["RH", "LH"]:
+            if hand_label in statuses:
+                text = f"{hand_label}: {statuses[hand_label]['msg']}"
+                color = statuses[hand_label]['color']
+                cv2.putText(image, text, (50, y_pos), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                y_pos += 40
 
-    # Display Independent Results
-    y_pos = 50
-    for hand_label in ["RH", "LH"]:
-        if hand_label in statuses:
-            text = f"{hand_label}: {statuses[hand_label]['msg']}"
-            color = statuses[hand_label]['color']
-            cv2.putText(image, text, (50, y_pos), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            y_pos += 40
-
-    cv2.imshow('DreamPlay Calibrated Tracking', image)
+    cv2.imshow('DreamPlay Auto-Calib Tracking', image)
     if cv2.waitKey(5) & 0xFF == 27: break
 
 cap.release()
