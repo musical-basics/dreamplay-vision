@@ -59,8 +59,32 @@ def check_stability(sorted_hands):
     return dist < STABILITY_THRESHOLD
 
 # --- CONFIGURATION ---
-font_scale = 1.5
-thickness = 4
+# --- CONFIGURATION ---
+font_scale = 1.0
+thickness = 2
+score_font_scale = 1.5
+score_thickness = 4
+
+# --- SCORING HELPERS ---
+def calculate_score(current_val, baseline_val, max_deviation):
+    # Calculate how far we are from 'Perfect' (baseline)
+    # Score drops as we deviate from baseline. 
+    # For wrist: deviation is how much LOWER (y increases) we are compared to baseline 'dist'.
+    # For fingers: deviation is how much straighter (angle closer to 180) we are compared to baseline angle.
+    
+    deviation = abs(current_val - baseline_val)
+    # Clamp deviation to max_deviation
+    deviation = min(deviation, max_deviation)
+    
+    # Linear drop: 0 deviation = 100%, max_deviation = 0%
+    score = 100 - (deviation / max_deviation * 100)
+    return int(max(0, score))
+
+def get_status_color(score):
+    if score >= 90: return (0, 255, 0)      # Green (Excellent)
+    if score >= 80: return (0, 255, 255)    # Yellow (Acceptable)
+    if score >= 70: return (0, 165, 255)    # Orange (Danger)
+    return (0, 0, 255)                      # Red (Critical)
 
 while cap.isOpened():
     success, image = cap.read()
@@ -73,40 +97,30 @@ while cap.isOpened():
     # Prepare sorting
     sorted_hands = []
     if results.multi_hand_landmarks:
-         # STRICT POSITIONAL SORTING: 
-         # The hand with higher X (right side of screen) is ALWAYS treated as RH.
-         # This assumes the camera is placed on the right side of the piano facing left.
+         # STRICT POSITIONAL SORTING: RR Hand = Higher X
          sorted_hands = sorted(results.multi_hand_landmarks, key=lambda h: h.landmark[0].x, reverse=True)
 
     # --- Manual Reset ---
     if cv2.waitKey(1) & 0xFF == ord('c'):
         current_state = STATE_COUNTDOWN
         timer_start = time.time()
-        # Reset data
         calibration_data_rh, calibration_data_lh = [], []
         print("Manual Reset Triggered")
 
     # --- STATE MACHINE ---
-    
     if current_state == STATE_WAITING:
         cv2.putText(image, "PLACE BOTH HANDS ON KEYS", (100, 150), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        
-        # Check if we should start countdown
         if len(sorted_hands) == 2 and check_stability(sorted_hands):
             current_state = STATE_COUNTDOWN
             timer_start = time.time()
             calibration_data_rh, calibration_data_lh = [], []
-            print("Auto-Detect: Starting Countdown...")
 
     elif current_state == STATE_COUNTDOWN:
         elapsed = time.time() - timer_start
         remaining = max(0, int(countdown_duration - elapsed + 1))
-        
-        # Big countdown centered
         cv2.putText(image, f"CALIBRATING IN: {remaining}", (150, 450), 
                     cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 255), 5)
-        
         if elapsed >= countdown_duration:
             current_state = STATE_CALIBRATING
             timer_start = time.time()
@@ -116,89 +130,108 @@ while cap.isOpened():
         elapsed = time.time() - timer_start
         prog = min(elapsed / calibration_duration, 1.0)
         
-        # Collect data
         if len(sorted_hands) >= 2:
-            # RH is index 0, LH is index 1
-            dist_rh = abs(sorted_hands[0].landmark[0].y - sorted_hands[0].landmark[9].y)
-            dist_lh = abs(sorted_hands[1].landmark[0].y - sorted_hands[1].landmark[9].y)
+            # RH [0], LH [1]
+            dist_rh = sorted_hands[0].landmark[0].y - sorted_hands[0].landmark[9].y
+            dist_lh = sorted_hands[1].landmark[0].y - sorted_hands[1].landmark[9].y
             calibration_data_rh.append(dist_rh)
             calibration_data_lh.append(dist_lh)
         
-        # Draw Progress Bar
         bar_width = int(prog * 400)
         cv2.rectangle(image, (100, 300), (500, 330), (50, 50, 50), -1) 
         cv2.rectangle(image, (100, 300), (100 + bar_width, 330), (0, 255, 0), -1)
-        cv2.putText(image, "HOLD STILL...", (100, 290), 
+        cv2.putText(image, "HOLD PERECT FORM...", (100, 290), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         if elapsed >= calibration_duration:
-            # Compute averages
             if calibration_data_rh:
                 baseline_rh["dist"] = sum(calibration_data_rh) / len(calibration_data_rh)
             if calibration_data_lh:
                 baseline_lh["dist"] = sum(calibration_data_lh) / len(calibration_data_lh)
             
+            # Start with ideal angles (approximating naturally curved fingers ~140-160 deg)
+            # We didn't explicitly calibrate angle in previous steps, let's assume 150 is ideal baseline
+            # Or we could have measured it. For now, we assume user held perfect form.
+            baseline_rh["angle"] = 140
+            baseline_lh["angle"] = 140
+            
             current_state = STATE_ACTIVE
-            print(f"Locked Baselines - RH: {baseline_rh['dist']:.3f}, LH: {baseline_lh['dist']:.3f}")
+            print(f"Baselines - RH Dist: {baseline_rh['dist']:.3f}")
 
     elif current_state == STATE_ACTIVE:
-        # --- TRACKING LOGIC ---
-        
-        # If no hands, we do nothing (screen clears automatically)
         if sorted_hands:
             for i, hand_landmarks in enumerate(sorted_hands):
-                # Only handle up to 2 hands
                 if i > 1: break
                 label = "RH" if i == 0 else "LH"
                 
-                wrist_y = hand_landmarks.landmark[0].y
-                knuckle_y = hand_landmarks.landmark[9].y
+                # 1. WRIST SCORE
+                # Measure (WristY - KnuckleY)
+                # Ideally, Wrist is ABOVE knuckle (lower Y). So (WristY - KnuckleY) should be negative.
+                # If Wrist drops, Y increases, (WristY - KnuckleY) becomes larger (more positive).
+                current_dist = hand_landmarks.landmark[0].y - hand_landmarks.landmark[9].y
+                base_dist = baseline_rh["dist"] if label == "RH" else baseline_lh["dist"]
                 
-                # Use calibrated baseline
-                baseline_dist = baseline_rh["dist"] if label == "RH" else baseline_lh["dist"]
+                # A drop in form means current_dist > base_dist.
+                # Deviation only matters if it's POSITIVE shift (flattening arch).
+                # If current_dist < base_dist (wrist even higher), that's fine/excellent.
+                wrist_deviation = max(0, current_dist - base_dist)
                 
-                error = ""
-                # Logic: If (wrist - knuckle) exceeds 20% of the baseline magnitude
-                threshold = baseline_dist * 0.2
-                current_dist = wrist_y - knuckle_y
-                
-                if current_dist > threshold:
-                    error = "Low Wrist"
-                    
-                # Check Flat Finger
+                # Max deviation allowed: ~0.15 (arbitrary units of 'drop')
+                wrist_score = calculate_score(current_dist, base_dist, 0.15)
+                # If we are strictly better (higher arch), clamp to 100
+                if current_dist < base_dist: wrist_score = 100
+
+                # 2. FINGER SCORE
+                # Check PIP angles (average of index, middle, ring, pinky)
+                total_angle = 0
+                count = 0
                 for pip_idx in [6, 10, 14, 18]:
                     mcp = [hand_landmarks.landmark[pip_idx-1].x, hand_landmarks.landmark[pip_idx-1].y]
                     pip = [hand_landmarks.landmark[pip_idx].x, hand_landmarks.landmark[pip_idx].y]
                     dip = [hand_landmarks.landmark[pip_idx+1].x, hand_landmarks.landmark[pip_idx+1].y]
-                    
-                    angle = calculate_angle(mcp, pip, dip)
-                    if angle > 165:
-                        if error == "": error = "Flat Finger"
-
-                # Store status
-                color = (0, 0, 255) if error != "" else (0, 255, 0)
-                msg = f"{label}: Incorrect ({error})" if error != "" else f"{label}: Correct"
+                    total_angle += calculate_angle(mcp, pip, dip)
+                    count += 1
+                avg_angle = total_angle / count
                 
-                # Draw skeleton
+                # Ideal is ~140. Flat is 180.
+                # Deviation towards 180 is bad.
+                angle_deviation = max(0, avg_angle - 140) 
+                # Max deviation: 40 degrees (140 to 180)
+                finger_score = calculate_score(avg_angle, 140, 40)
+                
+                # Aggregate Score
+                total_score = (wrist_score + finger_score) // 2
+                
+                # Determine Colors
+                main_color = get_status_color(total_score)
+                wrist_color = get_status_color(wrist_score)
+                finger_color = get_status_color(finger_score)
+
+                # Draw Skeleton
                 mp_draw.draw_landmarks(
-                    image, 
-                    hand_landmarks, 
-                    mp_hands.HAND_CONNECTIONS,
-                    mp_draw.DrawingSpec(color=color, thickness=2, circle_radius=2),
-                    mp_draw.DrawingSpec(color=color, thickness=2)
+                    image, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+                    mp_draw.DrawingSpec(color=main_color, thickness=2, circle_radius=2),
+                    mp_draw.DrawingSpec(color=main_color, thickness=2)
                 )
-                
-                # --- UI DISPLAY (Split Screen) ---
-                if label == "RH":
-                    # Top Right
-                    text_size = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
-                    x_pos = image.shape[1] - text_size[0] - 20
-                    cv2.putText(image, msg, (x_pos, 80), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
-                else:
-                    # Top Left
-                    cv2.putText(image, msg, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
 
-    cv2.imshow('DreamPlay Auto-Calib Tracking', image)
+                # UI Layout
+                if label == "LH":
+                    x_base = 20
+                else:
+                    # Right align
+                    x_base = image.shape[1] - 350
+                
+                # Main Score
+                cv2.putText(image, f"{label}: {int(total_score)}%", (x_base, 80), 
+                            cv2.FONT_HERSHEY_SIMPLEX, score_font_scale, main_color, score_thickness)
+                
+                # Sub-scores
+                cv2.putText(image, f"Wrist: {int(wrist_score)}%", (x_base, 130), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, wrist_color, 2)
+                cv2.putText(image, f"Fingers: {int(finger_score)}%", (x_base, 160), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, finger_color, 2)
+
+    cv2.imshow('DreamPlay Continuous Scoring', image)
     if cv2.waitKey(5) & 0xFF == 27: break
 
 cap.release()
