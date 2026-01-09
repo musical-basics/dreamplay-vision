@@ -58,6 +58,10 @@ def check_stability(sorted_hands):
     prev_hand_pos = current_pos
     return dist < STABILITY_THRESHOLD
 
+# --- CONFIGURATION ---
+font_scale = 1.5
+thickness = 4
+
 while cap.isOpened():
     success, image = cap.read()
     if not success: break
@@ -69,7 +73,9 @@ while cap.isOpened():
     # Prepare sorting
     sorted_hands = []
     if results.multi_hand_landmarks:
-         # Sort by X-coordinate (Higher X = Right Hand in side view)
+         # STRICT POSITIONAL SORTING: 
+         # The hand with higher X (right side of screen) is ALWAYS treated as RH.
+         # This assumes the camera is placed on the right side of the piano facing left.
          sorted_hands = sorted(results.multi_hand_landmarks, key=lambda h: h.landmark[0].x, reverse=True)
 
     # --- Manual Reset ---
@@ -90,7 +96,6 @@ while cap.isOpened():
         if len(sorted_hands) == 2 and check_stability(sorted_hands):
             current_state = STATE_COUNTDOWN
             timer_start = time.time()
-            # Clear data just in case
             calibration_data_rh, calibration_data_lh = [], []
             print("Auto-Detect: Starting Countdown...")
 
@@ -99,8 +104,8 @@ while cap.isOpened():
         remaining = max(0, int(countdown_duration - elapsed + 1))
         
         # Big countdown centered
-        cv2.putText(image, f"CALIBRATING IN: {remaining}", (150, 250), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 4)
+        cv2.putText(image, f"CALIBRATING IN: {remaining}", (150, 450), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 255), 5)
         
         if elapsed >= countdown_duration:
             current_state = STATE_CALIBRATING
@@ -138,15 +143,9 @@ while cap.isOpened():
 
     elif current_state == STATE_ACTIVE:
         # --- TRACKING LOGIC ---
-        statuses = {}
         
-        # Only process if we have hands (or hold last state? let's just process what we see)
-        if results.multi_hand_landmarks:
-            # We continue to use X-sorting. If one hand disappears, 
-            # the remaining hand becomes index 0 (RH).
-            # Limitation: losing one hand might mislabel the other if strictly X-sorted.
-            # But for this prototype, we assume user keeps hands in frame for monitoring.
-            
+        # If no hands, we do nothing (screen clears automatically)
+        if sorted_hands:
             for i, hand_landmarks in enumerate(sorted_hands):
                 # Only handle up to 2 hands
                 if i > 1: break
@@ -160,7 +159,6 @@ while cap.isOpened():
                 
                 error = ""
                 # Logic: If (wrist - knuckle) exceeds 20% of the baseline magnitude
-                # (Assuming baseline captured a 'good' distance magnitude)
                 threshold = baseline_dist * 0.2
                 current_dist = wrist_y - knuckle_y
                 
@@ -179,9 +177,8 @@ while cap.isOpened():
 
                 # Store status
                 color = (0, 0, 255) if error != "" else (0, 255, 0)
-                msg = f"Incorrect ({error})" if error != "" else "Correct"
-                statuses[label] = {"msg": msg, "color": color}
-
+                msg = f"{label}: Incorrect ({error})" if error != "" else f"{label}: Correct"
+                
                 # Draw skeleton
                 mp_draw.draw_landmarks(
                     image, 
@@ -190,16 +187,16 @@ while cap.isOpened():
                     mp_draw.DrawingSpec(color=color, thickness=2, circle_radius=2),
                     mp_draw.DrawingSpec(color=color, thickness=2)
                 )
-
-        # Display Text
-        y_pos = 50
-        for hand_label in ["RH", "LH"]:
-            if hand_label in statuses:
-                text = f"{hand_label}: {statuses[hand_label]['msg']}"
-                color = statuses[hand_label]['color']
-                cv2.putText(image, text, (50, y_pos), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                y_pos += 40
+                
+                # --- UI DISPLAY (Split Screen) ---
+                if label == "RH":
+                    # Top Right
+                    text_size = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
+                    x_pos = image.shape[1] - text_size[0] - 20
+                    cv2.putText(image, msg, (x_pos, 80), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
+                else:
+                    # Top Left
+                    cv2.putText(image, msg, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
 
     cv2.imshow('DreamPlay Auto-Calib Tracking', image)
     if cv2.waitKey(5) & 0xFF == 27: break
