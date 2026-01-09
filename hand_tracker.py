@@ -175,6 +175,11 @@ active_camera_index = 0
 # --- USER INPUT / MOUSE ---
 mouse_click = None # (x, y) coordinates of last click, reset after processing
 
+# --- ROBUST TRACKING GLOBALS ---
+LOST_TRACK_TIMEOUT = 0.5  # Seconds to "remember" a hand
+hand_last_seen = {"RH": 0, "LH": 0}
+last_known_landmarks = {"RH": None, "LH": None}
+
 def mouse_callback(event, x, y, flags, param):
     global mouse_click
     if event == cv2.EVENT_LBUTTONDOWN:
@@ -229,8 +234,8 @@ def main():
     global current_state, timer_start, mouse_click, prev_hand_pos
     global calibration_data_rh, calibration_data_lh, tracked_hands
     global baseline_rh, baseline_lh
-    global baseline_rh, baseline_lh
     global active_camera_index, dropdown_open, camera_list
+    global hand_last_seen, last_known_landmarks
 
     mp_hands = mp.solutions.hands
     hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.8, max_num_hands=2)
@@ -504,33 +509,48 @@ def main():
             # pass
 
         elif current_state == STATE_ACTIVE:
-            # Persistent Tracking Logic
-            def get_wrist(hl): return np.array([hl.landmark[0].x, hl.landmark[0].y])
-            final_assignments = {}
+            # --- ROBUST IDENTITY LOCKING (THE MOAT) ---
+            now = time.time()
+            current_frame_assignments = {"RH": None, "LH": None}
             
             if detected_hands:
-                if tracked_hands["RH"] is not None and tracked_hands["LH"] is not None:
-                    matches = []
-                    for idx, hl in enumerate(detected_hands):
-                        pos = get_wrist(hl)
-                        d_rh = np.linalg.norm(pos - tracked_hands["RH"])
-                        d_lh = np.linalg.norm(pos - tracked_hands["LH"])
-                        matches.append( (d_rh, "RH", idx) )
-                        matches.append( (d_lh, "LH", idx) )
-                    
-                    matches.sort(key=lambda x: x[0])
-                    assigned_ids = set()
-                    assigned_idxs = set()
-                    for dist, target_id, det_idx in matches:
-                        if target_id not in assigned_ids and det_idx not in assigned_idxs:
-                            final_assignments[target_id] = detected_hands[det_idx]
-                            tracked_hands[target_id] = get_wrist(detected_hands[det_idx])
-                            assigned_ids.add(target_id)
-                            assigned_idxs.add(det_idx)
+                # Sort by Scale (Anatomical Signature)
+                # RH is closer to camera -> Larger Wrist-to-Knuckle distance
+                sorted_by_scale = sorted(detected_hands, key=lambda h: 
+                    np.linalg.norm(np.array([h.landmark[0].x, h.landmark[0].y]) - 
+                                   np.array([h.landmark[9].x, h.landmark[9].y])), 
+                    reverse=True)
+                
+                # Assignment 1: Largest is RH
+                if len(sorted_by_scale) > 0:
+                    current_frame_assignments["RH"] = sorted_by_scale[0]
+                    hand_last_seen["RH"] = now
+                    last_known_landmarks["RH"] = sorted_by_scale[0]
+                
+                # Assignment 2: Second largest is LH
+                if len(sorted_by_scale) > 1:
+                    current_frame_assignments["LH"] = sorted_by_scale[1]
+                    hand_last_seen["LH"] = now
+                    last_known_landmarks["LH"] = sorted_by_scale[1]
             
             # --- SCORING & DRAWING ---
             for label in ["RH", "LH"]:
-                hand_landmarks = final_assignments.get(label)
+                hand_landmarks = current_frame_assignments[label]
+                
+                # Persistence Check (Ghost Tracking)
+                if hand_landmarks is None:
+                    if now - hand_last_seen[label] < LOST_TRACK_TIMEOUT:
+                        hand_landmarks = last_known_landmarks[label]
+                        # Optional: Draw ghost with lower opacity or different style?
+                        # For now, just keeping it alive is enough.
+                    else:
+                        # Truly lost -> Clear history eventually? 
+                        # Or just append 0?
+                        # Let's append 0 to show drop, or hold 0?
+                        # Code below only appends if hand_landmarks exists.
+                        # We should probably append 0 if lost for feedback continuity
+                        pass
+
                 if hand_landmarks:
                     # 1. Wrist
                     c_dist = hand_landmarks.landmark[0].y - hand_landmarks.landmark[9].y
