@@ -477,10 +477,18 @@ def main():
             
             if len(detected_hands) >= 2:
                 # Capture
+                # Y Dist (Tech)
                 d_rh = detected_hands[0].landmark[0].y - detected_hands[0].landmark[9].y
                 d_lh = detected_hands[1].landmark[0].y - detected_hands[1].landmark[9].y
-                calibration_data_rh.append(d_rh)
-                calibration_data_lh.append(d_lh)
+                
+                # Scale Dist (Biometric)
+                s_rh = np.linalg.norm(np.array([detected_hands[0].landmark[0].x, detected_hands[0].landmark[0].y]) - 
+                                      np.array([detected_hands[0].landmark[9].x, detected_hands[0].landmark[9].y]))
+                s_lh = np.linalg.norm(np.array([detected_hands[1].landmark[0].x, detected_hands[1].landmark[0].y]) - 
+                                      np.array([detected_hands[1].landmark[9].x, detected_hands[1].landmark[9].y]))
+
+                calibration_data_rh.append({'dist': d_rh, 'scale': s_rh})
+                calibration_data_lh.append({'dist': d_lh, 'scale': s_lh})
                 
                 # Snapshot tracked positions
                 tracked_hands["RH"] = np.array([detected_hands[0].landmark[0].x, detected_hands[0].landmark[0].y])
@@ -496,8 +504,12 @@ def main():
             
             if elapsed >= calibration_duration:
                 # Finalize
-                if calibration_data_rh: baseline_rh["dist"] = sum(calibration_data_rh) / len(calibration_data_rh)
-                if calibration_data_lh: baseline_lh["dist"] = sum(calibration_data_lh) / len(calibration_data_lh)
+                if calibration_data_rh: 
+                    baseline_rh["dist"] = sum(d['dist'] for d in calibration_data_rh) / len(calibration_data_rh)
+                    baseline_rh["scale"] = sum(d['scale'] for d in calibration_data_rh) / len(calibration_data_rh)
+                if calibration_data_lh:
+                    baseline_lh["dist"] = sum(d['dist'] for d in calibration_data_lh) / len(calibration_data_lh)
+                    baseline_lh["scale"] = sum(d['scale'] for d in calibration_data_lh) / len(calibration_data_lh)
                 
                 # Auto-Save and Continue
                 fname = save_profile_file()
@@ -509,49 +521,81 @@ def main():
             # pass
 
         elif current_state == STATE_ACTIVE:
-            # --- ROBUST IDENTITY LOCKING (THE MOAT) ---
+            # --- PHASE 12: BIOMETRIC ANCHOR & DECAY ---
             now = time.time()
             current_frame_assignments = {"RH": None, "LH": None}
             
+            # Default baselines if missing (legacy profile support)
+            base_scale_rh = baseline_rh.get("scale", 0.05) # Approx default
+            base_scale_lh = baseline_lh.get("scale", 0.03) # Approx default
+            
             if detected_hands:
-                # Sort by Scale (Anatomical Signature)
-                # RH is closer to camera -> Larger Wrist-to-Knuckle distance
-                sorted_by_scale = sorted(detected_hands, key=lambda h: 
-                    np.linalg.norm(np.array([h.landmark[0].x, h.landmark[0].y]) - 
-                                   np.array([h.landmark[9].x, h.landmark[9].y])), 
-                    reverse=True)
+                # Assign each hand to closest biometric baseline
+                unassigned_hands = detected_hands.copy()
                 
-                # Assignment 1: Largest is RH
-                if len(sorted_by_scale) > 0:
-                    current_frame_assignments["RH"] = sorted_by_scale[0]
+                # 1. Best fit for RH
+                best_rh_hand = None
+                best_rh_diff = float('inf')
+                
+                for hl in unassigned_hands:
+                    curr_scale = np.linalg.norm(np.array([hl.landmark[0].x, hl.landmark[0].y]) - 
+                                                np.array([hl.landmark[9].x, hl.landmark[9].y]))
+                    diff = abs(curr_scale - base_scale_rh)
+                    if diff < best_rh_diff:
+                        best_rh_diff = diff
+                        best_rh_hand = hl
+                
+                # 2. Best fit for LH (compete or independent?)
+                # Improved Logic: Global Optimization would be best, but Greedy is okay if keys distinct.
+                # Let's simple check: Is a hand closer to RH or LH?
+                
+                assignments = []
+                for hl in detected_hands:
+                    curr_scale = np.linalg.norm(np.array([hl.landmark[0].x, hl.landmark[0].y]) - 
+                                                np.array([hl.landmark[9].x, hl.landmark[9].y]))
+                    dist_rh = abs(curr_scale - base_scale_rh)
+                    dist_lh = abs(curr_scale - base_scale_lh)
+                    
+                    label = "RH" if dist_rh < dist_lh else "LH"
+                    assignments.append((label, hl, min(dist_rh, dist_lh)))
+                
+                # Sort by fit quality to prevent stealing?
+                # Actually, simpler: just populate. If conflict, take best fit?
+                # Conflict resolution:
+                rh_candidates = [x for x in assignments if x[0] == "RH"]
+                lh_candidates = [x for x in assignments if x[0] == "LH"]
+                
+                if rh_candidates:
+                    # Take best fitting RH
+                    rh_candidates.sort(key=lambda x: x[2])
+                    current_frame_assignments["RH"] = rh_candidates[0][1]
                     hand_last_seen["RH"] = now
-                    last_known_landmarks["RH"] = sorted_by_scale[0]
-                
-                # Assignment 2: Second largest is LH
-                if len(sorted_by_scale) > 1:
-                    current_frame_assignments["LH"] = sorted_by_scale[1]
+                    last_known_landmarks["RH"] = rh_candidates[0][1]
+                    
+                if lh_candidates:
+                    lh_candidates.sort(key=lambda x: x[2])
+                    current_frame_assignments["LH"] = lh_candidates[0][1]
                     hand_last_seen["LH"] = now
-                    last_known_landmarks["LH"] = sorted_by_scale[1]
+                    last_known_landmarks["LH"] = lh_candidates[0][1]
             
             # --- SCORING & DRAWING ---
             for label in ["RH", "LH"]:
                 hand_landmarks = current_frame_assignments[label]
+                alpha = 1.0
                 
-                # Persistence Check (Ghost Tracking)
+                # Persistence Check (Ghost Decay)
                 if hand_landmarks is None:
-                    if now - hand_last_seen[label] < LOST_TRACK_TIMEOUT:
+                    elapsed = now - hand_last_seen[label]
+                    if elapsed < LOST_TRACK_TIMEOUT:
                         hand_landmarks = last_known_landmarks[label]
-                        # Optional: Draw ghost with lower opacity or different style?
-                        # For now, just keeping it alive is enough.
+                        # Calculate Fade
+                        # Fully visible for 0.1s, then fade to 0 over remaining 0.4s
+                        if elapsed > 0.1:
+                            alpha = max(0, 1.0 - (elapsed - 0.1) / (LOST_TRACK_TIMEOUT - 0.1))
                     else:
-                        # Truly lost -> Clear history eventually? 
-                        # Or just append 0?
-                        # Let's append 0 to show drop, or hold 0?
-                        # Code below only appends if hand_landmarks exists.
-                        # We should probably append 0 if lost for feedback continuity
-                        pass
+                        pass # Truly lost
 
-                if hand_landmarks:
+                if hand_landmarks and alpha > 0.05:
                     # 1. Wrist
                     c_dist = hand_landmarks.landmark[0].y - hand_landmarks.landmark[9].y
                     b_dist = baseline_rh["dist"] if label == "RH" else baseline_lh["dist"]
@@ -572,27 +616,51 @@ def main():
                     # Total
                     total_score = (w_score + f_score) // 2
                     
-                    # History
+                    # History (Only update if live? Or repeat last if ghost? Duplicate last if ghost to keep graph moving?)
+                    # If ghost, maybe don't append to graph to avoid flatline? 
+                    # User wants continuity. Let's append last known or current.
                     graph_history[label]["total"].append(total_score)
                     graph_history[label]["wrist"].append(w_score)
                     graph_history[label]["finger"].append(f_score)
                     
-                    # Draw
-                    color = get_status_color(total_score)
-                    mp_draw.draw_landmarks(image, hand_landmarks, mp_hands.HAND_CONNECTIONS,
-                                           mp_draw.DrawingSpec(color=color, thickness=2, circle_radius=2),
-                                           mp_draw.DrawingSpec(color=color, thickness=2))
+                    # Draw Skeleton (Custom Alpha)
+                    # Mp_draw doesn't support alpha easily, so we overlay
+                    # Simple hack: Draw to overlay, blend?
+                    # Or just draw standard if alpha high, skip if low?
+                    # User requested fade.
                     
-                    # UI Text
+                    if alpha < 0.99:
+                        # Draw to temp layer
+                        stencil = image.copy()
+                        color = get_status_color(total_score)
+                        mp_draw.draw_landmarks(stencil, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+                                               mp_draw.DrawingSpec(color=color, thickness=2, circle_radius=2),
+                                               mp_draw.DrawingSpec(color=color, thickness=2))
+                        # Blend
+                        cv2.addWeighted(stencil, alpha, image, 1 - alpha, 0, image)
+                    else:
+                        color = get_status_color(total_score)
+                        mp_draw.draw_landmarks(image, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+                                               mp_draw.DrawingSpec(color=color, thickness=2, circle_radius=2),
+                                               mp_draw.DrawingSpec(color=color, thickness=2))
+                    
+                    # UI Text with Color Scaling (Simulated Alpha)
                     x_base = 20 if label == "LH" else image.shape[1] - 350
+                    
+                    # Dim color based on alpha
+                    def apply_alpha(clr, a):
+                        return (int(clr[0]*a), int(clr[1]*a), int(clr[2]*a))
+                    
+                    txt_color = apply_alpha(color, alpha)
+                    
                     # Main
                     cv2.putText(image, f"{label}: {int(total_score)}%", (x_base, 80), 
-                                cv2.FONT_HERSHEY_SIMPLEX, score_font_scale, color, score_thickness)
+                                cv2.FONT_HERSHEY_SIMPLEX, score_font_scale, txt_color, score_thickness)
                     # Sub-scores
                     cv2.putText(image, f"Wrist: {int(w_score)}%", (x_base, 130), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, get_status_color(w_score), 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, apply_alpha(get_status_color(w_score), alpha), 2)
                     cv2.putText(image, f"Fingers: {int(f_score)}%", (x_base, 170), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, get_status_color(f_score), 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, apply_alpha(get_status_color(f_score), alpha), 2)
                     
                 # Always draw graphs
                 if len(graph_history[label]["total"]) > 1:
