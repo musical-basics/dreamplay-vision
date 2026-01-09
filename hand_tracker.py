@@ -11,54 +11,51 @@ score_font_scale = 1.5
 score_thickness = 4
 
 # --- SCORING HELPERS ---
-def calculate_wrist_score(current_val, baseline_val):
+def get_pro_score(val, baseline, is_wrist=True):
     """
-    Stricter scoring for Wrist.
-    If current_val > baseline_val (wrist dropping), penalize heavily.
-    If current_val <= baseline_val (wrist higher), 100% score (NO penalty for high wrist in this context, 
-    though extremely high wrist might be bad, usually "Low Wrist" is the main error).
+    Advanced Scoring using Exponential/Sigmoid decay.
     """
-    # deviation positive = drop
-    deviation = current_val - baseline_val
-    
-    if deviation <= 0:
-        return 100
-    
-    # We want a noticeable drop even for small deviation.
-    # User said 0:14 was "clearly low" but got 92%.
-    # Let's make the penalty multiplier stronger.
-    # Deviation is in normalized coords (0.0 to 1.0).
-    # A drop of 0.05 is significant. 
-    # 0.05 * x = penalty. If we want 0.05 to be ~70% score (30 penalty), x = 600.
-    
-    penalty = deviation * 800 # Strong penalty
-    score = 100 - penalty
-    return int(max(0, score))
-
-def calculate_finger_score(avg_angle):
-    """
-    Forgiving scoring for Fingers.
-    Only penalize if angle is approaching 180 (flat).
-    Ignore over-curving (angle < 140).
-    """
-    # Threshold where we start penalizing
-    # User said 0:18 fingers were curved but got 6%.
-    # Old logic penalized deviation from 150 in both directions.
-    # New logic: penalize only if > 160.
-    
-    start_penalty_angle = 160
-    if avg_angle <= start_penalty_angle:
-        return 100
-    
-    # Range 160 to 180 is bad.
-    # 180 should be 0 score.
-    # 20 degrees range.
-    
-    deviation = avg_angle - start_penalty_angle
-    # Map 0..20 to 0..100 penalty
-    penalty = (deviation / 20.0) * 100
-    score = 100 - penalty
-    return int(max(0, score))
+    if is_wrist:
+        # WRIST: High sensitivity.
+        # Deviation > 0 means drop.
+        # Val is y-dist. Baseline is y-dist.
+        # If val > baseline, it's a drop.
+        deviation = val - baseline
+        if deviation <= 0: return 100
+        
+        # Exponential penalty
+        # deviation of 0.05 should be bad.
+        # exp(-15 * 0.05) = 0.47 * 100 = 47.
+        # exp(-30 * 0.05) = 0.22 * 100 = 22.
+        # User wants "High sensitivity".
+        return int(100 * np.exp(-20 * deviation))
+    else:
+        # FINGERS: Forgiving Sigmoid.
+        # Val is Angle (degrees). Baseline is Ideal Angle (~140).
+        # We only care if angle approaches 180.
+        # Normalize deviation to 0..1 range (140->180 is 40 deg range)
+        
+        # If angle < 150, it's perfect (100).
+        if val < 155: return 100
+        
+        # Map 155..185 to some range
+        # We want 160 to be ~85-90
+        # We want 175 to be ~10-20
+        
+        # Using the user's sigmoid idea: 100 / (1 + exp(k*(dev - threshold)))
+        # Let's normalize val: 
+        norm_val = (val - 140) / 40.0 # 140->0, 180->1.0
+        
+        # Threshold: point where score is 50%. Let's say at 170 deg (0.75)
+        # Slope k: steepness.
+        
+        # 100 / (1 + exp(15 * (norm_val - 0.75)))
+        # At 160 (0.5): exp(15 * -0.25) = exp(-3.75) ~ 0.02. 100/1.02 ~ 98.
+        # At 170 (0.75): exp(0) = 1. 100/2 = 50.
+        # At 175 (0.875): exp(15 * 0.125) = exp(1.875) ~ 6.5. 100/7.5 ~ 13.
+        
+        score = 100 / (1 + np.exp(15 * (norm_val - 0.75)))
+        return int(score)
 
 def get_status_color(score):
     if score >= 90: return (0, 255, 0)      # Green (Excellent)
@@ -67,52 +64,56 @@ def get_status_color(score):
     return (0, 0, 255)                      # Red (Critical)
 
 # --- GRAPH HELPER ---
-# History for 120 frames (approx 4-5 seconds at 30fps)
+# History for 120 frames
 graph_history = {
-    "RH": {"total": deque([100]*120, maxlen=120), "wrist": deque([100]*120, maxlen=120), "fingers": deque([100]*120, maxlen=120)},
-    "LH": {"total": deque([100]*120, maxlen=120), "wrist": deque([100]*120, maxlen=120), "fingers": deque([100]*120, maxlen=120)}
+    "RH": {"total": deque([100]*120, maxlen=120), "wrist": deque([100]*120, maxlen=120), "finger": deque([100]*120, maxlen=120)},
+    "LH": {"total": deque([100]*120, maxlen=120), "wrist": deque([100]*120, maxlen=120), "finger": deque([100]*120, maxlen=120)}
 }
 
-def draw_triple_graph(img, data, side="RH"):
-    """Draws a scrolling triple-line graph."""
-    width, height = 300, 120 # Enlarged as requested
+GRAPH_W, GRAPH_H = 400, 200 # Bigger
+SECTION_H = GRAPH_H // 3    # 3 equal sections
+
+def draw_area_graph(img, history_data, side="RH"):
     margin = 30
+    x_start = img.shape[1] - GRAPH_W - margin if side == "RH" else margin
+    y_start = img.shape[0] - GRAPH_H - margin
     
-    # Position
-    x_start = img.shape[1] - width - margin if side == "RH" else margin
-    y_start = img.shape[0] - height - margin
+    # Draw Legend Labels
+    # Order from Top to Bottom: Total, Wrist, Finger
+    # But y grows down. So Top is y_start.
     
-    # Draw Background
-    cv2.rectangle(img, (x_start, y_start), (x_start + width, y_start + height), (30, 30, 30), -1)
+    labels = [("TOTAL", (255, 255, 255)), ("WRIST", (255, 200, 0)), ("FINGER", (0, 255, 100))]
+    keys = ["total", "wrist", "finger"]
     
-    # Labels
-    cv2.putText(img, f"{side} TREND", (x_start + 5, y_start + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-    
-    # Helper to plot one deque
-    def plot_line(history, color, thickness=1):
-        if not history: return
-        pts = []
-        for i, val in enumerate(history):
-            px = x_start + int(i * (width / 120))
-            py = y_start + height - int(val * (height / 100))
-            pts.append((px, py))
-        if len(pts) > 1:
-            cv2.polylines(img, [np.array(pts)], False, color, thickness)
+    for i, (label_text, label_color) in enumerate(labels):
+        s_y = y_start + (i * SECTION_H)
+        
+        # Draw Section Background
+        cv2.rectangle(img, (x_start, s_y), (x_start + GRAPH_W, s_y + SECTION_H), (30, 30, 30), -1)
+        # Separator line
+        cv2.line(img, (x_start, s_y + SECTION_H), (x_start + GRAPH_W, s_y + SECTION_H), (100, 100, 100), 1)
+
+        # Draw Legend Text OUTSIDE the graph
+        text_x = x_start - 80 if side=="RH" else x_start + GRAPH_W + 10
+        cv2.putText(img, label_text, (text_x, s_y + 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, label_color, 1)
+        
+        # Plot Area
+        key = keys[i]
+        data = history_data[key]
+        
+        for t, score in enumerate(data):
+            moment_color = get_status_color(score)
             
-    # Draw 3 lines
-    # WRIST: Blue (Cyan-ish)
-    plot_line(data["wrist"], (255, 255, 0), 1) 
-    # FINGERS: Green (or a distinct color) -> User said "Green/Yellow Line". Let's use Magenta for contrast or Green.
-    # Graphs often use Red/Green/Blue. Let's use:
-    # Wrist: Cyan (255, 255, 0)
-    # Fingers: Magenta (255, 0, 255)
-    # Total: White (255, 255, 255)
-    
-    plot_line(data["fingers"], (255, 0, 255), 1)
-    plot_line(data["total"], (255, 255, 255), 2)
-    
-    # Legend
-    # We can add small dots/text if needed, but keeping it clean for now.
+            # Map t (0..119) to x
+            line_x = x_start + int(t * (GRAPH_W / 120))
+            
+            # Height based on score (0..100) -> (0..SECTION_H)
+            bar_h = int((score / 100) * SECTION_H)
+            
+            # Draw vertical line from bottom of section UP
+            # Bottom is s_y + SECTION_H
+            cv2.line(img, (line_x, s_y + SECTION_H), (line_x, s_y + SECTION_H - bar_h), moment_color, 2)
 
 # --- TRACKING SETUP ---
 # Helper function
@@ -271,12 +272,12 @@ while cap.isOpened():
             hand_landmarks = final_assignments.get(label)
             
             if hand_landmarks:
-                # 1. Wrist Score (Stricter)
+                # 1. Wrist Score (Exp penalty)
                 current_dist = hand_landmarks.landmark[0].y - hand_landmarks.landmark[9].y
                 base_dist = baseline_rh["dist"] if label == "RH" else baseline_lh["dist"]
-                wrist_score = calculate_wrist_score(current_dist, base_dist)
+                wrist_score = get_pro_score(current_dist, base_dist, is_wrist=True)
 
-                # 2. Finger Score (Forgiving of curvature)
+                # 2. Finger Score (Sigmoid)
                 total_angle = 0
                 count = 0
                 for pip_idx in [6, 10, 14, 18]:
@@ -286,7 +287,7 @@ while cap.isOpened():
                     total_angle += calculate_angle(mcp, pip, dip)
                     count += 1
                 avg_angle = total_angle / count
-                finger_score = calculate_finger_score(avg_angle)
+                finger_score = get_pro_score(avg_angle, 140, is_wrist=False)
 
                 # Total
                 total_score = (wrist_score + finger_score) // 2
@@ -294,7 +295,7 @@ while cap.isOpened():
                 # Update History
                 graph_history[label]["total"].append(total_score)
                 graph_history[label]["wrist"].append(wrist_score)
-                graph_history[label]["fingers"].append(finger_score)
+                graph_history[label]["finger"].append(finger_score)
                 
                 # Colors
                 main_color = get_status_color(total_score)
@@ -318,16 +319,13 @@ while cap.isOpened():
                 cv2.putText(image, f"Fingers: {int(finger_score)}%", (x_base, 160), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, finger_color, 2)
             else:
-                # If hand lost, maybe append last score or 0? 
-                # Let's append 0 to show drop in graph or nothing?
-                # User says "stop registering". We won't update graph to pause it.
                 pass
 
         # Always draw graphs if history exists
         if len(graph_history["RH"]["total"]) > 1:
-            draw_triple_graph(image, graph_history["RH"], side="RH")
+            draw_area_graph(image, graph_history["RH"], side="RH")
         if len(graph_history["LH"]["total"]) > 1:
-            draw_triple_graph(image, graph_history["LH"], side="LH")
+            draw_area_graph(image, graph_history["LH"], side="LH")
 
     cv2.imshow('DreamPlay Continuous Scoring', image)
     if cv2.waitKey(5) & 0xFF == 27: break
