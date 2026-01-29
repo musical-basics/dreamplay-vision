@@ -49,11 +49,13 @@ class UI:
         
         btn_play = (cx, start_y, btn_w, btn_h)
         btn_load = (cx, start_y + gap, btn_w, btn_h)
-        btn_settings = (cx, start_y + gap*2, btn_w, btn_h)
-        btn_exit = (cx, start_y + gap*3, btn_w, btn_h)
+        btn_video = (cx, start_y + gap*2, btn_w, btn_h)
+        btn_settings = (cx, start_y + gap*3, btn_w, btn_h)
+        btn_exit = (cx, start_y + gap*4, btn_w, btn_h)
         
         self.draw_button(image, btn_play, "BEGIN PLAYING")
         self.draw_button(image, btn_load, "LOAD PROFILE")
+        self.draw_button(image, btn_video, "PROCESS VIDEO")
         self.draw_button(image, btn_settings, "SETTINGS")
         self.draw_button(image, btn_exit, "EXIT")
 
@@ -61,6 +63,7 @@ class UI:
         if click:
             if self.is_clicked(btn_play, click): return "PLAY"
             elif self.is_clicked(btn_load, click): return "LOAD"
+            elif self.is_clicked(btn_video, click): return "VIDEO"
             elif self.is_clicked(btn_settings, click): return "SETTINGS"
             elif self.is_clicked(btn_exit, click): return "EXIT"
         return None
@@ -182,3 +185,23 @@ class UI:
         
         cv2.putText(image, msg, (tx, ty), 
                     cv2.FONT_HERSHEY_TRIPLEX, 1.2, (0, 255, 255), 2)
+
+    def draw_progress(self, image, current, total):
+        overlay = image.copy()
+        cv2.rectangle(overlay, (0, image.shape[0]-60), (image.shape[1], image.shape[0]), (0,0,0), -1)
+        cv2.addWeighted(overlay, 0.7, image, 0.3, 0, image)
+        
+        # Progress Bar
+        margin = 50
+        bar_w = image.shape[1] - (margin*2)
+        filled_w = int(bar_w * (current / total)) if total > 0 else 0
+        
+        start_x = margin
+        start_y = image.shape[0] - 40
+        
+        cv2.rectangle(image, (start_x, start_y), (start_x + bar_w, start_y + 20), (50,50,50), -1)
+        cv2.rectangle(image, (start_x, start_y), (start_x + filled_w, start_y + 20), (0, 255, 0), -1)
+        
+        pct = int((current / total) * 100) if total > 0 else 0
+        cv2.putText(image, f"PROCESSING... {pct}%", (start_x, start_y - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)

@@ -1,6 +1,7 @@
 import cv2
 import time
 import numpy as np
+import subprocess
 from .config import *
 from .vision import CameraSystem
 from .scorer import HandScorer
@@ -30,6 +31,25 @@ def main():
     
     # Settings State
     dropdown_open = False
+    cached_cameras = []
+    
+    # Video Processing State
+    video_cap = None
+    video_writer = None
+    total_frames = 0
+    current_frame_idx = 0
+
+    def pick_file():
+        try:
+            # macOS Native File Picker via AppleScript
+            cmd = """osascript -e 'set f to choose file of type {"mp4", "mov", "avi"} with prompt "Select a video to process"' -e 'POSIX path of f'"""
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if result.returncode == 0:
+                p = result.stdout.strip()
+                if p: return p
+        except Exception as e:
+            print(f"File picker error: {e}")
+        return None
     
     # Window
     cv2.namedWindow('DreamPlay Vision')
@@ -40,14 +60,36 @@ def main():
     
     while True:
         # 2. Get Data
-        frame, image = cam.get_frame()
-        if frame is None:
-            break
+        if state == STATE_PROCESSING:
+            if video_cap and video_cap.isOpened():
+                success, raw_frame = video_cap.read()
+                if not success:
+                    state = STATE_MENU
+                    print("Video processing complete.")
+                    if video_writer: video_writer.release()
+                    video_cap.release()
+                    continue
+                # Video is usually BGR from cv2.VideoCapture
+                frame_bgr = raw_frame
+                image = raw_frame.copy() # BGR for drawing
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) # RGB for detection
+                current_frame_idx += 1
+            else:
+                state = STATE_MENU
+                continue
+        else:
+            # cam.get_frame returns (BGR, RGB)
+            frame_bgr, frame_rgb = cam.get_frame()
+            if frame_bgr is None:
+                break
+            image = frame_bgr.copy() # Use BGR for drawing and display
             
         # Process Hands only if needed
         hands_data = []
         if state not in [STATE_MENU, STATE_LOAD_PROFILE, STATE_SETTINGS]:
-             hands_data = cam.detect_hands(image)
+             # Detect needs RGB
+             if frame_rgb is not None:
+                hands_data = cam.detect_hands(frame_rgb)
 
         # 3. Logic Branching
         if state == STATE_MENU:
@@ -58,6 +100,28 @@ def main():
                 state = STATE_LOAD_PROFILE
             elif action == "SETTINGS":
                 state = STATE_SETTINGS
+                # Refresh camera list only when entering settings or explicit refresh
+                # Here we just refresh every time we see it? 
+                # Better: check if empty or refresh button.
+                # For now, let's refresh if empty to init
+                if not cached_cameras:
+                     cached_cameras = cam.get_camera_names()
+            elif action == "VIDEO":
+                fpath = pick_file()
+                if fpath:
+                    video_cap = cv2.VideoCapture(fpath)
+                    total_frames = int(video_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    current_frame_idx = 0
+                    
+                    save_path = fpath.rsplit('.', 1)[0] + "_processed.mp4"
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    fps = video_cap.get(cv2.CAP_PROP_FPS)
+                    w = int(video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    h = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    video_writer = cv2.VideoWriter(save_path, fourcc, fps, (w, h))
+                    
+                    print(f"Processing {fpath}...")
+                    state = STATE_PROCESSING
             elif action == "EXIT":
                 break
                 
@@ -69,15 +133,19 @@ def main():
             box_x, box_y, box_w, box_h = 100, 210, 400, 50
             main_box = (box_x, box_y, box_w, box_h)
             
-            # Current cam name
-            cameras = cam.get_camera_names()
+            # Use cached list
+            if not cached_cameras: cached_cameras = cam.get_camera_names()
+            
             current_name = "Unknown"
             # Find name of active index
-            for c in cameras:
+            for c in cached_cameras:
                 if c['index'] == cam.active_camera_index:
                     current_name = c['name']
                     break
             
+            if current_name == "Unknown" and cached_cameras:
+                 # Fallback if active index isn't in list (e.g. unplugged)
+                 current_name = f"Camera {cam.active_camera_index}"
             cv2.rectangle(image, (box_x, box_y), (box_x + box_w, box_y + box_h), (60, 60, 60), -1)
             cv2.rectangle(image, (box_x, box_y), (box_x + box_w, box_y + box_h), (200, 200, 200), 2)
             cv2.putText(image, current_name, (box_x + 15, box_y + 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -95,7 +163,7 @@ def main():
                     dropdown_open = not dropdown_open
                 
                 if dropdown_open:
-                     for i, dev in enumerate(cameras):
+                     for i, dev in enumerate(cached_cameras):
                         opt_y = box_y + box_h + (i * 45)
                         opt_rect = (box_x, opt_y, box_w, 45)
                         if ui.is_clicked(opt_rect, click):
@@ -103,7 +171,7 @@ def main():
                             dropdown_open = False
             
             if dropdown_open:
-                for i, dev in enumerate(cameras):
+                for i, dev in enumerate(cached_cameras):
                     opt_y = box_y + box_h + (i * 45)
                     color = (0, 100, 0) if dev['index'] == cam.active_camera_index else (80, 80, 80)
                     cv2.rectangle(image, (box_x, opt_y), (box_x + box_w, opt_y + 45), color, -1)
@@ -155,6 +223,8 @@ def main():
                 timer_start = time.time()
                 calibration_data = {"RH": [], "LH": []}
 
+            cv2.putText(image, "[M] Menu", (50, image.shape[0]-50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 1)
+
         elif state == STATE_COUNTDOWN:
             elapsed = time.time() - timer_start
             rem = max(0, int(COUNTDOWN_DURATION - elapsed + 1))
@@ -169,6 +239,8 @@ def main():
             if elapsed >= COUNTDOWN_DURATION:
                 state = STATE_CALIBRATING
                 timer_start = time.time()
+            
+            cv2.putText(image, "[M] Menu", (50, image.shape[0]-50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 1)
 
         elif state == STATE_CALIBRATING:
             elapsed = time.time() - timer_start
@@ -208,7 +280,9 @@ def main():
                 profile.save_profile(profile.current_baselines["RH"], profile.current_baselines["LH"])
                 state = STATE_ACTIVE
 
-        elif state == STATE_ACTIVE:
+            cv2.putText(image, "[M] Menu", (50, image.shape[0]-50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 1)
+                
+        elif state == STATE_ACTIVE or state == STATE_PROCESSING:
             now = time.time()
             current_frame_assignments = {"RH": None, "LH": None}
             
@@ -267,7 +341,12 @@ def main():
                 if len(scorer.history[label]["total"]) > 1:
                     ui.draw_area_graph(image, scorer.history[label], side=label)
 
-            cv2.putText(image, "[M] Menu  [C] Recalibrate", (50, image.shape[0]-50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 1)
+            if state == STATE_PROCESSING:
+                ui.draw_progress(image, current_frame_idx, total_frames)
+                if video_writer: video_writer.write(image)
+                cv2.putText(image, "Press [ESC] to Cancel", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+            else:
+                cv2.putText(image, "[M] Menu  [C] Recalibrate", (50, image.shape[0]-50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 1)
 
         # 4. Render
         cv2.imshow("DreamPlay Vision", image)
@@ -275,7 +354,11 @@ def main():
         # Handle Keys
         key = cv2.waitKey(1) & 0xFF
         if key == 27: # ESC
-             if state == STATE_MENU: break
+             if state == STATE_PROCESSING:
+                 state = STATE_MENU
+                 if video_writer: video_writer.release()
+                 if video_cap: video_cap.release()
+             elif state == STATE_MENU: break
              else: state = STATE_MENU
         elif key == ord('m'):
             state = STATE_MENU
